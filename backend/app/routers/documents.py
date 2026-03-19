@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 
@@ -7,11 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.config import settings
-from app.database import get_db
-from app.models import User, Document
+from app.database import get_db, AsyncSessionLocal
+from app.models import User, Document, ContextCard
 from app.schemas import DocumentResponse, PageSelectionUpdate, GenerateCardsRequest
 from app.services import pdf_service
 from app.utils.auth import get_current_user
+from app.utils.db_retry import with_retry
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
@@ -172,8 +176,58 @@ async def generate_cards(
     doc.error_message = None
     await db.commit()
 
-    # Card generation task added in Phase 5
+    background_tasks.add_task(
+        _run_card_generation,
+        doc.id,
+        str(Path(settings.UPLOAD_DIR) / doc.filename),
+        doc.selected_start,
+        doc.selected_end,
+    )
     return {"message": "Processing started", "document_id": doc.id}
+
+
+# ── Background task ──────────────────────────────────────────────────────────
+
+async def _run_card_generation(
+    doc_id: int,
+    file_path: str,
+    start_page: int,
+    end_page: int,
+):
+    """
+    Runs as a FastAPI BackgroundTask.
+    Fully wrapped in try/except — any failure sets status='failed' + error_message.
+    """
+    from app.services.summarizer import process_document_pages
+
+    async with AsyncSessionLocal() as db:
+        try:
+            cards_data = await process_document_pages(file_path, start_page, end_page)
+
+            async def _insert_cards():
+                result = await db.execute(select(Document).where(Document.id == doc_id))
+                doc = result.scalar_one()
+                for card_dict in cards_data:
+                    db.add(ContextCard(document_id=doc_id, **card_dict))
+                doc.status = "done"
+                await db.commit()
+
+            await with_retry(_insert_cards)
+            logger.info("Card generation complete for document %d (%d cards)", doc_id, len(cards_data))
+
+        except Exception as exc:
+            logger.exception("Card generation failed for document %d", doc_id)
+            try:
+                async def _mark_failed():
+                    result = await db.execute(select(Document).where(Document.id == doc_id))
+                    doc = result.scalar_one()
+                    doc.status = "failed"
+                    doc.error_message = str(exc)
+                    await db.commit()
+
+                await with_retry(_mark_failed)
+            except Exception:
+                logger.exception("Could not update failure status for document %d", doc_id)
 
 
 # ── Helper ───────────────────────────────────────────────────────────────────
