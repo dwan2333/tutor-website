@@ -12,11 +12,11 @@ An AI-powered tutorial website that runs **entirely on your local machine**. Upl
 |-------|-----------|-------------|
 | Frontend | Next.js 14 (App Router) + TypeScript + Tailwind CSS | Same as online plan |
 | Backend | FastAPI (Python 3.12) | Same as online plan |
-| Database | SQLite (SQLAlchemy async + aiosqlite) | Replaces PostgreSQL — zero setup, single file |
-| Task Queue | FastAPI BackgroundTasks | Replaces Celery + Redis — no extra processes |
-| PDF Parsing | PyMuPDF (fitz) | Same as online plan |
-| AI Model | Anthropic Claude API | Needs your ANTHROPIC_API_KEY in `.env` |
-| Visualizations | Mermaid.js | Same as online plan |
+| Database | SQLite + WAL mode (SQLAlchemy async + aiosqlite) | Replaces PostgreSQL — zero setup, single file; WAL mode prevents lock errors |
+| Task Queue | FastAPI BackgroundTasks + `asyncio.to_thread()` | Replaces Celery + Redis; CPU-bound work offloaded to thread pool |
+| PDF Parsing | PyMuPDF (fitz) | Same as online plan — runs in thread pool to avoid blocking event loop |
+| AI Model | Anthropic Claude API (streaming via WebSocket) | Needs your ANTHROPIC_API_KEY in `.env`; streamed token-by-token |
+| Visualizations | Mermaid.js + React Error Boundary | Same as online plan; error boundary catches bad syntax gracefully |
 | File Storage | Local folder `storage/uploads/` | Replaces cloud storage |
 
 ---
@@ -44,10 +44,10 @@ An AI-powered tutorial website that runs **entirely on your local machine**. Upl
 - Diagram renders as SVG directly in the browser
 - If rendering fails, a "Regenerate" button appears
 
-### 4. Per-Card Chatbox
+### 4. Per-Card Chatbox (WebSocket Streaming)
 - Every Context Card has its own chat interface below it
-- User types a question; Claude answers using the card's summary as context
-- Responses appear after a short loading indicator
+- User types a question; Claude streams the answer token-by-token via WebSocket
+- Text appears in real time — no frozen UI while waiting 10–15 seconds for a full response
 - Full chat history preserved per card in SQLite
 
 ### 5. User Accounts (Local Auth)
@@ -64,10 +64,9 @@ An AI-powered tutorial website that runs **entirely on your local machine**. Upl
 | Community Library | Requires a shared database and user discovery |
 | Resource Discovery (YouTube/SerpAPI) | Requires paid API keys + external calls |
 | Self-Owned TutorAI Training | Requires GPU infrastructure + HuggingFace pipeline |
-| Real-time WebSocket streaming | Simplified to request/response for local use |
 | Docker Compose | Not needed — run services directly |
-| PostgreSQL | Replaced by SQLite |
-| Redis + Celery | Replaced by FastAPI BackgroundTasks |
+| PostgreSQL | Replaced by SQLite + WAL mode |
+| Redis + Celery | Replaced by FastAPI BackgroundTasks + asyncio.to_thread() |
 
 ---
 
@@ -87,13 +86,14 @@ tutor-website/                        ← root of repo
 │   │   │   ├── documents.py          ← /api/documents/ (upload, list, pages, generate)
 │   │   │   └── context_cards.py      ← /api/cards/ (list, diagram, chat)
 │   │   ├── services/
-│   │   │   ├── pdf_service.py        ← PyMuPDF extract text + thumbnails
+│   │   │   ├── pdf_service.py        ← PyMuPDF extract text + thumbnails (runs via asyncio.to_thread)
 │   │   │   ├── summarizer.py         ← Claude API: generate titles + summaries
-│   │   │   ├── diagram_service.py    ← Claude API: generate Mermaid code
-│   │   │   └── chat_service.py       ← Claude API: card Q&A chat
+│   │   │   ├── diagram_service.py    ← Claude API: generate + validate Mermaid code
+│   │   │   └── chat_service.py       ← Claude API: streaming card Q&A over WebSocket
 │   │   └── utils/
 │   │       ├── auth.py               ← JWT encode/decode, password hashing
-│   │       └── chunking.py           ← Text chunking helpers
+│   │       ├── chunking.py           ← Text chunking helpers
+│   │       └── db_retry.py           ← Exponential backoff retry for DB writes
 │   └── requirements.txt
 │
 ├── frontend/
@@ -111,7 +111,8 @@ tutor-website/                        ← root of repo
 │       ├── components/
 │       │   ├── Navbar.tsx            ← Top nav (logo, login/logout)
 │       │   ├── StudyCard.tsx         ← Single context card (summary + diagram + chat)
-│       │   └── MermaidDiagram.tsx    ← Mermaid SVG renderer
+│       │   ├── MermaidDiagram.tsx    ← Mermaid SVG renderer
+│       │   └── MermaidErrorBoundary.tsx  ← React Error Boundary: catches bad syntax, shows Regenerate button
 │       └── lib/
 │           └── api.ts                ← Axios instance + all API call functions
 │
@@ -128,6 +129,77 @@ tutor-website/                        ← root of repo
 ├── PLAN_LOCAL.md                     ← This file
 └── CLAUDE.md                         ← Claude Code guidance
 ```
+
+---
+
+## Architectural Fixes (Applied from Code Review)
+
+### Fix 1 — CPU-Bound PDF Parsing (asyncio.to_thread)
+PyMuPDF text extraction is CPU-intensive. Running it synchronously inside `BackgroundTasks` blocks the entire Python async event loop, freezing the server.
+
+**Solution:** Wrap all PyMuPDF calls with `asyncio.to_thread()` so they run in a separate thread pool without blocking:
+```python
+pages = await asyncio.to_thread(extract_text_from_pages, file_path, start, end)
+```
+
+### Fix 2 — SQLite "Database is Locked" Errors (WAL mode + retry)
+SQLite locks the entire database file during writes. Concurrent inserts (generating cards) while the frontend polls for status causes 500 errors.
+
+**Solution — three layers:**
+1. **WAL mode on startup** in `database.py`:
+   ```python
+   async with engine.connect() as conn:
+       await conn.execute(text("PRAGMA journal_mode=WAL;"))
+   ```
+2. **Timeout in connection string:**
+   ```
+   sqlite+aiosqlite:///./storage/tutor.db?timeout=30
+   ```
+3. **Retry helper** in `utils/db_retry.py` — exponential backoff (100ms → 200ms → 400ms, max 3 attempts) wrapping any `INSERT` or `UPDATE` that could hit contention.
+
+### Fix 3 — Silent Background Task Failures (try/except + status update)
+FastAPI `BackgroundTasks` have no built-in retry or error reporting. A Claude API timeout or PDF parse crash leaves the document stuck in `"processing"` forever.
+
+**Solution:** Wrap the entire background task in `try/except`. On any exception:
+- Update document `status` to `"failed"`
+- Save the error message to a new `error_message` column on the `documents` table
+- The frontend reads this and shows a **"Retry"** button
+
+The `documents` table gains one new column:
+
+| Column | Type | Notes |
+|--------|------|-------|
+| error_message | TEXT | nullable — populated on failure |
+
+### Fix 4 — WebSocket Streaming for Chat
+Claude 3.5 can take 10–15 seconds for long answers. A plain HTTP response leaves the UI frozen and looking broken.
+
+**Solution:** Replace the HTTP `POST /api/cards/{card_id}/chat` endpoint with a **WebSocket** endpoint:
+```
+WS  /ws/cards/{card_id}/chat
+```
+- Client sends a JSON message `{"message": "..."}` over the socket
+- Backend calls `client.messages.stream(...)` and forwards each text delta to the frontend as it arrives
+- Frontend renders tokens in real time as they stream in
+- On completion, the full exchange is saved to `chat_messages` in SQLite
+
+### Fix 5 — Mermaid Hallucination Handling
+Claude frequently produces invalid Mermaid DSL (bad bracket syntax, unsupported keywords). Passing this to the frontend crashes the renderer.
+
+**Solution — two layers:**
+
+**Backend** (`diagram_service.py`) — lightweight validation before returning:
+```python
+VALID_STARTS = ("graph ", "flowchart ", "sequenceDiagram", "mindmap", "classDiagram", "erDiagram")
+if not any(code.strip().startswith(s) for s in VALID_STARTS):
+    raise ValueError(f"Invalid Mermaid output: {code[:80]}")
+```
+If validation fails, the endpoint retries once with a stricter prompt before raising a 422 error.
+
+**Frontend** (`MermaidErrorBoundary.tsx`) — React Error Boundary wrapping `<MermaidDiagram>`:
+- If the SVG renderer throws, the boundary catches it
+- Displays: `"Syntax Error — click Regenerate to try again"` with a **Regenerate** button
+- Prevents the crash from propagating and tearing down the whole Study page
 
 ---
 
@@ -153,6 +225,7 @@ tutor-website/                        ← root of repo
 | selected_start | INTEGER | nullable |
 | selected_end | INTEGER | nullable |
 | status | TEXT | uploaded / processing / done / failed |
+| error_message | TEXT | nullable — set on failure, shown as "Retry" prompt |
 | created_at | DATETIME | |
 
 ### `context_cards`
@@ -205,9 +278,9 @@ tutor-website/                        ← root of repo
 |--------|------|-------------|
 | GET | `/api/cards/document/{doc_id}` | List all cards for a document |
 | GET | `/api/cards/{card_id}` | Get single card |
-| POST | `/api/cards/{card_id}/diagram` | Generate Mermaid diagram for a card |
+| POST | `/api/cards/{card_id}/diagram` | Generate + validate Mermaid diagram for a card |
 | GET | `/api/cards/{card_id}/messages` | Get chat history for a card |
-| POST | `/api/cards/{card_id}/chat` | Send a message, get AI reply |
+| **WS** | `/ws/cards/{card_id}/chat` | **WebSocket** — stream AI reply token-by-token |
 
 ---
 
@@ -311,16 +384,16 @@ Open `http://localhost:3000`
 | Phase | What Gets Built | Output |
 |-------|----------------|--------|
 | 1 | Project scaffold, git setup, `.env`, folder structure | Repo pushed to GitHub |
-| 2 | Backend: database, models, schemas, auth (register/login/me) | `/api/auth/*` working |
+| 2 | Backend: database (WAL mode), models + `error_message` column, schemas, auth | `/api/auth/*` working, WAL enabled |
 | 3 | Backend: PDF upload, file storage, page count | `/api/documents/upload` working |
 | 4 | Backend: page selection, thumbnail endpoint | Page range + thumbnails working |
-| 5 | Backend: summarizer service + card generation background task | Cards generated from PDF |
-| 6 | Backend: diagram service (Mermaid generation via Claude) | Diagrams per card |
-| 7 | Backend: chat service (per-card Q&A with Claude) | Chat messages saved + returned |
-| 8 | Frontend: login, register, dashboard pages | Auth flow working |
+| 5 | Backend: summarizer + card generation task (`asyncio.to_thread` + try/except + db_retry) | Cards generated; failures surface "failed" status |
+| 6 | Backend: diagram service (Mermaid generation + syntax validation + retry) | Valid diagrams per card; 422 on bad output |
+| 7 | Backend: WebSocket chat endpoint (`/ws/cards/{card_id}/chat`) with streaming | Tokens stream to frontend in real time |
+| 8 | Frontend: login, register, dashboard pages (shows error_message + Retry button) | Auth flow + failure recovery working |
 | 9 | Frontend: upload page (drag-drop, page selector, generate) | Full upload flow |
 | 10 | Frontend: study page (cards, status polling, diagram toggle) | Cards visible |
-| 11 | Frontend: chatbox per card + MermaidDiagram renderer | Full local app working |
+| 11 | Frontend: streaming chatbox (WebSocket) + MermaidDiagram + MermaidErrorBoundary | Full local app working, resilient to crashes |
 
 ---
 
@@ -330,7 +403,10 @@ Open `http://localhost:3000`
 - [ ] Upload PDF → page count shown
 - [ ] Set page range → hit "Generate Cards" → spinner shows
 - [ ] Poll until status = "done" → cards appear
+- [ ] Simulate failure (bad API key) → status shows "failed" + Retry button appears
 - [ ] Toggle diagram type on a card → Mermaid SVG renders
-- [ ] Ask a question in card chat → AI reply appears
+- [ ] Trigger bad Mermaid output → Error Boundary shows "Regenerate" instead of crashing
+- [ ] Ask a question in card chat → tokens stream in real time via WebSocket
+- [ ] Send multiple chat messages rapidly → no SQLite lock errors
 - [ ] Delete a document → removed from dashboard
 - [ ] Refresh page → cards still there (persisted in SQLite)
